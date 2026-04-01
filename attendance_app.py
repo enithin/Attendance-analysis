@@ -5,13 +5,13 @@ from datetime import datetime
 
 # --- 1. CONFIGURATION & HR POLICIES ---
 SHIFTS = {
-    'Female':  {'start': 570, 'end': 1140}, # 09:30 - 19:00
-    'Special': {'start': 570, 'end': 1110}, # 09:30 - 18:30
-    'Male':    {'start': 600, 'end': 1200}, # 10:00 - 20:00
-    'Sunday':  {'start': 600, 'end': 1020}  # 10:00 - 17:00
+    'Female':  {'start': 570, 'end': 1140}, 
+    'Special': {'start': 570, 'end': 1110}, 
+    'Male':    {'start': 600, 'end': 1200}, 
+    'Sunday':  {'start': 600, 'end': 1020}  
 }
 
-LUNCH_START, LUNCH_END = 750, 930 # 12:30 PM to 03:30 PM
+LUNCH_START, LUNCH_END = 750, 930
 LUNCH_LIMIT, TEA_LIMIT = 60, 15
 HALF_DAY_THRESHOLD, FULL_DAY_MINIMUM = 210, 360 
 
@@ -26,11 +26,16 @@ def analyze_day_full(punch_str, shift_cat, is_sunday, is_holiday, h_type):
     res = {
         'Status': '🔴 LEAVE', 'Work_Mins': 0, 'Lunch_Mins': 0, 'Tea_Mins': 0,
         'Late_In': 0, 'Early_In': 0, 'Late_Out': 0, 'Early_Out': 0, 
-        'Audit': '', 'Day_Value': 0.0, 'Holiday_Work_Bonus': 0
+        'Audit': '', 'Day_Value': 0.0, 'Holiday_Work_Bonus': 0,
+        'Sunday_Worked': 0  # <--- FIXED: Explicitly tracking actual worked Sundays
     }
     
     val = str(punch_str).strip().lower()
     if pd.isna(punch_str) or val in ["", "nan", "0", "none"]:
+        if is_sunday:
+            res['Status'] = '🏠 Sunday Off'
+        elif is_holiday:
+            res['Status'] = f'🌴 Holiday Off ({str(h_type).title()})'
         return res
 
     matches = re.findall(r'(\d{1,2}:\d{2}(?::\d{2})?\s?(?:am|pm)?)', val)
@@ -53,12 +58,8 @@ def analyze_day_full(punch_str, shift_cat, is_sunday, is_holiday, h_type):
         return res
 
     s_cfg = SHIFTS['Sunday'] if is_sunday else SHIFTS.get(str(shift_cat).strip(), SHIFTS['Special'])
-    
-    # Calculate Punctuality Metrics
-    res['Late_In'] = max(0, t_mins[0] - s_cfg['start'])
-    res['Early_In'] = max(0, s_cfg['start'] - t_mins[0])
-    res['Late_Out'] = max(0, t_mins[-1] - s_cfg['end'])
-    res['Early_Out'] = max(0, s_cfg['end'] - t_mins[-1])
+    res['Late_In'], res['Early_In'] = max(0, t_mins[0]-s_cfg['start']), max(0, s_cfg['start']-t_mins[0])
+    res['Late_Out'], res['Early_Out'] = max(0, t_mins[-1]-s_cfg['end']), max(0, s_cfg['end']-t_mins[-1])
 
     logs = []
     if res['Late_In'] > 5: logs.append(f"Late({res['Late_In']}m)")
@@ -83,13 +84,19 @@ def analyze_day_full(punch_str, shift_cat, is_sunday, is_holiday, h_type):
             res['Tea_Mins'] += gap
             if gap > TEA_LIMIT: logs.append(f"Long Tea({gap}m)")
 
-    if is_holiday and h_type == 'common' and res['Work_Mins'] >= HALF_DAY_THRESHOLD:
+    if is_holiday and str(h_type).lower() == 'common' and res['Work_Mins'] >= HALF_DAY_THRESHOLD:
         res['Holiday_Work_Bonus'] = 1
 
-    if is_sunday: res['Status'], res['Day_Value'] = "⭐ Sunday Work", 1.0
-    elif res['Work_Mins'] >= FULL_DAY_MINIMUM: res['Status'], res['Day_Value'] = "✅ Present", 1.0
-    elif res['Work_Mins'] >= HALF_DAY_THRESHOLD: res['Status'], res['Day_Value'] = "🕒 Half Day", 0.5
-    else: res['Status'], res['Day_Value'] = "🔴 Short Duration", 0.0
+    # --- FIXED: Only credit Sunday_Worked if they actually worked ---
+    if is_sunday and res['Work_Mins'] >= HALF_DAY_THRESHOLD: 
+        res['Status'], res['Day_Value'] = "⭐ Sunday Work", 1.0
+        res['Sunday_Worked'] = 1
+    elif res['Work_Mins'] >= FULL_DAY_MINIMUM: 
+        res['Status'], res['Day_Value'] = "✅ Present", 1.0
+    elif res['Work_Mins'] >= HALF_DAY_THRESHOLD: 
+        res['Status'], res['Day_Value'] = "🕒 Half Day", 0.5
+    else: 
+        res['Status'], res['Day_Value'] = "🔴 LEAVE (Short)", 0.0
 
     res['Audit'] = ", ".join(logs)
     return res
@@ -134,8 +141,17 @@ if att_f and staff_f and h_f and sal_f:
         df_att_clean = df_att.drop(columns=overlap)
 
         h_date_c = find_c(df_h, ['date', 'holiday'])
+        h_type_c = find_c(df_h, ['type', 'category'])
+        h_rel_c = find_c(df_h, ['religion', 'faith'])
+        
         df_h[h_date_c] = pd.to_datetime(df_h[h_date_c]).dt.date
-        h_map = {row[h_date_c]: (str(row.get('Type', 'Common')).lower(), str(row.get('Religion', 'None')).lower()) for _, row in df_h.iterrows()}
+        
+        def build_h_map(row):
+            t = str(row[h_type_c]).strip().lower() if h_type_c else 'common'
+            rel = str(row[h_rel_c]).strip().lower() if h_rel_c else 'none'
+            return t, rel
+
+        h_map = {row[h_date_c]: build_h_map(row) for _, row in df_h.iterrows()}
 
         report_raw = pd.merge(df_att_clean, df_staff, left_on=att_id_c, right_on=staff_id_c, how='left')
         report_raw[staff_name_c] = report_raw[staff_name_c].fillna("Unknown Staff")
@@ -144,8 +160,9 @@ if att_f and staff_f and h_f and sal_f:
             d = r['AttendanceDate']
             if d in h_map:
                 t, rel = h_map[d]
-                emp_rel = str(r.get(staff_rel_c, 'None')).lower() if staff_rel_c else 'none'
-                return (True, t) if (t == 'common' or rel == emp_rel) else (False, None)
+                emp_rel = str(r.get(staff_rel_c, 'None')).strip().lower() if staff_rel_c else 'none'
+                if t == 'common' or rel == emp_rel:
+                    return True, t
             return False, None
 
         report_raw[['IsHoliday', 'H_Type']] = report_raw.apply(lambda r: pd.Series(get_h_info(r)), axis=1)
@@ -155,26 +172,30 @@ if att_f and staff_f and h_f and sal_f:
         report = pd.concat([report_raw.reset_index(drop=True), pd.DataFrame(results)], axis=1)
         report = report[report['Status'] != 'Skipped']
 
-        # --- 4. HR POLICY ENGINE ---
+        # --- 4. HR POLICY ENGINE (NORMALIZED) ---
         summary = report.groupby([staff_id_c, staff_name_c]).agg({
-            'Day_Value': 'sum', 'Status': lambda x: (x == '🔴 LEAVE').sum(),
-            'IsSunday': 'sum', 'Holiday_Work_Bonus': 'sum'
+            'Day_Value': 'sum', 
+            'Status': lambda x: x.astype(str).str.contains('🔴 LEAVE').sum(), # Safe leave counter
+            'Sunday_Worked': 'sum', # <--- FIXED: Now aggregates actual worked Sundays, NOT calendar Sundays
+            'Holiday_Work_Bonus': 'sum'
         }).reset_index()
 
         def hr_policy(row):
-            total_leaves, sundays = row['Status'], row['IsSunday']
-            net_leaves = max(0, total_leaves - sundays)
+            total_leaves = row['Status']
+            sundays_worked = row['Sunday_Worked'] 
+            
+            net_leaves = max(0, total_leaves - sundays_worked)
             encashment = 2 if total_leaves == 0 else 0
             
             if net_leaves > 4: 
                 deduction = total_leaves 
-                note = f"Penalty (>4 Net Leaves)"
+                note = f"Penalty Triggered (>4 Net Leaves)"
             elif net_leaves > 2: 
                 deduction = net_leaves - 2 
                 note = f"2 Paid, {deduction} Unpaid"
             else: 
                 deduction = 0 
-                note = "Within Limit"
+                note = "Within 2 Paid Limit"
             
             period_days = len(report['AttendanceDate'].unique())
             final_payable = (period_days - deduction) + row['Holiday_Work_Bonus'] + encashment
@@ -190,24 +211,14 @@ if att_f and staff_f and h_f and sal_f:
 
         with tab1:
             disp = report if sel_staff == "All Staff" else report[report[staff_name_c] == sel_staff]
-            
-            # --- FIXED: Added missing Punctuality Columns ---
-            cols_to_show = [
-                staff_name_c, 'AttendanceDate', 'Status', 'Work_Mins', 
-                'Early_In', 'Late_In', 'Early_Out', 'Late_Out', 'Audit'
-            ]
-            view_df = disp[cols_to_show].copy()
-            
-            # Rename for clean viewing
-            view_df.columns = [
-                'Name', 'Date', 'Status', 'Work (Mins)', 
-                'Early In (m)', 'Late In (m)', 'Early Out (m)', 'Late Out (m)', 'Audit Logs'
-            ]
+            view_df = disp[[staff_name_c, 'AttendanceDate', 'Status', 'Work_Mins', 'Early_In', 'Late_In', 'Early_Out', 'Late_Out', 'Audit']].copy()
+            view_df.columns = ['Name', 'Date', 'Status', 'Work (Mins)', 'Early In (m)', 'Late In (m)', 'Early Out (m)', 'Late Out (m)', 'Audit Logs']
             st.dataframe(view_df, use_container_width=True)
 
         with tab2:
-            st.subheader("Payroll Performance")
+            st.subheader("Payroll Performance (Normalized)")
             st.dataframe(summary, use_container_width=True)
+            st.download_button("📥 Export CSV", summary.to_csv(index=False), "payroll_summary.csv")
 
         with tab3:
             if sel_staff == "All Staff": 
@@ -228,7 +239,6 @@ if att_f and staff_f and h_f and sal_f:
                     earned = round((base / period) * perf['Final_Payable'], 2)
                     deduction_amount = round((base / period) * perf['Deduction'], 2)
                     
-                    # --- FIXED: String Concatenation to avoid Markdown Code Block bugs ---
                     color_red = '#e74c3c' if perf['Deduction'] > 0 else '#333'
                     
                     html_slip = (
@@ -270,7 +280,6 @@ if att_f and staff_f and h_f and sal_f:
                         "</div>"
                     )
                     
-                    # Render the HTML safely
                     st.markdown(html_slip, unsafe_allow_html=True)
-                    st.write("") # Small spacer
-                    st.button("🖨️ Print Slip (Use Ctrl+P)")
+                    st.write("") 
+                    st.button("🖨️ Print Slip (Ctrl+P)")
